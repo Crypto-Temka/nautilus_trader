@@ -283,6 +283,14 @@ pub struct LighterExecutionClientConfig {
     /// Optional transaction quota override (req/min), independent of `rest_quota_per_min`;
     /// unset keeps 60. Enforced across the HTTP and WebSocket sendTx paths (execution only).
     pub sendtx_quota_per_min: Option<u32>,
+    /// Optional coalescing window in milliseconds for outbound transactions.
+    ///
+    /// When set to a non-zero value, signed create and cancel transactions are
+    /// held for up to this long and dispatched as a single WebSocket
+    /// `sendTxBatch` frame (at most [`crate::common::consts::LIGHTER_MAX_BATCH_TX`]
+    /// per frame), which the venue meters as one request. `None` or `0` keeps
+    /// the default one-transaction-per-frame `sendTx` behavior.
+    pub tx_batch_window_ms: Option<u64>,
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
@@ -303,6 +311,7 @@ nautilus_core::impl_pyo3_config_getters!(LighterExecutionClientConfig {
     market_order_slippage_bps: u32,
     rest_quota_per_min: Option<u32>,
     sendtx_quota_per_min: Option<u32>,
+    tx_batch_window_ms: Option<u64>,
     transport_backend: TransportBackend,
 });
 
@@ -330,6 +339,7 @@ impl Debug for LighterExecutionClientConfig {
             .field("market_order_slippage_bps", &self.market_order_slippage_bps)
             .field("rest_quota_per_min", &self.rest_quota_per_min)
             .field("sendtx_quota_per_min", &self.sendtx_quota_per_min)
+            .field("tx_batch_window_ms", &self.tx_batch_window_ms)
             .field("transport_backend", &self.transport_backend)
             .finish()
     }
@@ -383,6 +393,17 @@ impl LighterExecutionClientConfig {
     #[must_use]
     pub const fn chain_id(&self) -> u32 {
         deployment::chain_id(self.deployment, self.environment)
+    }
+
+    /// Returns the transaction coalescing window, or `None` when batching is off.
+    ///
+    /// A configured `0` is treated the same as unset so operators can disable
+    /// batching without switching the field back to `None`.
+    #[must_use]
+    pub fn tx_batch_window(&self) -> Option<std::time::Duration> {
+        self.tx_batch_window_ms
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
     }
 }
 
@@ -595,6 +616,7 @@ mod tests {
             market_order_slippage_bps: 50,
             rest_quota_per_min: None,
             sendtx_quota_per_min: None,
+            tx_batch_window_ms: None,
             transport_backend: TransportBackend::default(),
         };
 

@@ -659,6 +659,27 @@ acknowledgement latency, not send rate. `sendTx` does not count against the clie
 | Pending orders                       | 500/account, 16/market      | Venue limit; adapter does not pre-count it.          |
 | Active orders                        | 1,500/account, 1,000/market | Venue limit; adapter does not pre-count it.          |
 
+### Transaction batching
+
+Set `tx_batch_window_ms` on the execution client to coalesce outbound transactions into the
+WebSocket `sendTxBatch` frame, which the venue meters as a single request. Signed create and cancel
+transactions are held for up to that many milliseconds and dispatched together, flushing early once
+15 transactions (the venue's per-frame cap) have accumulated. Each frame spends one token from the
+transaction limiter regardless of how many transactions it carries, so a quoting session that
+churns through `sendtx_quota_per_min` can trade a few milliseconds of latency for an order of
+magnitude more headroom.
+
+`None` or `0` keeps the default behavior of one `sendTx` frame per transaction. Notes:
+
+- Transactions in a frame carry consecutive nonces and are applied in order. A rejected batch is
+  rejected as a whole: every order in it receives `OrderRejected` / `OrderCancelRejected`, and the
+  nonce baseline is hard-refreshed from the venue's `nextNonce`.
+- `submit_order_list` and `batch_cancel_orders` feed the same queue, so their transactions
+  naturally coalesce into one frame.
+- `modify_order` is not batched and keeps using single-transaction `sendTx`.
+- Enabling the window raises the local nonce skip-window to 32, since one in-flight frame reserves
+  up to 15 nonces before any of them reaches the venue.
+
 Common REST endpoint weights from the official docs:
 
 | Endpoint group                       | Weight | Adapter behavior                                |
@@ -802,6 +823,7 @@ endpoints.
 | `market_order_slippage_bps` | `50`          | Slippage cap (bps) for `MARKET` / `STOP_MARKET` / `MIT`.      |
 | `rest_quota_per_min`        | `None`        | REST quota override; unset keeps 60 req/min.                  |
 | `sendtx_quota_per_min`      | `None`        | Transaction quota override; unset keeps 60 req/min.           |
+| `tx_batch_window_ms`        | `None`        | Coalescing window for `sendTxBatch`; unset sends one tx/frame.|
 | `transport_backend`         | Default       | WebSocket transport backend.                                  |
 
 ### Configuration example

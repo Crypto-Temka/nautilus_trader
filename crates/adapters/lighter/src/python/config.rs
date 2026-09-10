@@ -111,6 +111,7 @@ impl LighterExecutionClientConfig {
         market_order_slippage_bps = None,
         rest_quota_per_min = None,
         sendtx_quota_per_min = None,
+        tx_batch_window_ms = None,
         transport_backend = None,
         deployment = None,
         venue = None,
@@ -130,6 +131,7 @@ impl LighterExecutionClientConfig {
         market_order_slippage_bps: Option<u32>,
         rest_quota_per_min: Option<u32>,
         sendtx_quota_per_min: Option<u32>,
+        tx_batch_window_ms: Option<u64>,
         transport_backend: Option<TransportBackend>,
         deployment: Option<LighterDeployment>,
         venue: Option<Venue>,
@@ -152,6 +154,7 @@ impl LighterExecutionClientConfig {
                 .unwrap_or(defaults.market_order_slippage_bps),
             rest_quota_per_min,
             sendtx_quota_per_min,
+            tx_batch_window_ms,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
         }
     }

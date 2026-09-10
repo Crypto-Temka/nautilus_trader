@@ -83,6 +83,18 @@ pub enum NautilusWsMessage {
         message: String,
         tx_hash: Option<String>,
     },
+    /// Venue response to a `jsonapi/sendtxbatch` request.
+    ///
+    /// The venue answers a batch with one status for the whole frame plus the
+    /// transaction hashes it accepted, in submission order; there are no
+    /// per-transaction codes. `code == 200` means the whole batch was
+    /// accepted, anything else rejects every transaction in it.
+    SendTxBatchAck {
+        connection_epoch: u64,
+        code: i64,
+        tx_hashes: Vec<String>,
+        message: Option<String>,
+    },
     Raw(serde_json::Value),
     Reconnected {
         connection_epoch: u64,
@@ -116,6 +128,17 @@ impl NautilusWsMessage {
                 code,
                 message,
                 tx_hash,
+            },
+            Self::SendTxBatchAck {
+                code,
+                tx_hashes,
+                message,
+                ..
+            } => Self::SendTxBatchAck {
+                connection_epoch,
+                code,
+                tx_hashes,
+                message,
             },
             other => other,
         }
@@ -182,6 +205,8 @@ pub enum LighterWsRequest {
     Unsubscribe { channel: String },
     #[serde(rename = "jsonapi/sendtx")]
     SendTx { data: LighterWsSendTx },
+    #[serde(rename = "jsonapi/sendtxbatch")]
+    SendTxBatch { data: LighterWsSendTxBatch },
 }
 
 impl Debug for LighterWsRequest {
@@ -202,6 +227,10 @@ impl Debug for LighterWsRequest {
                 .finish(),
             Self::SendTx { data } => f
                 .debug_struct(stringify!(SendTx))
+                .field("data", data)
+                .finish(),
+            Self::SendTxBatch { data } => f
+                .debug_struct(stringify!(SendTxBatch))
                 .field("data", data)
                 .finish(),
         }
@@ -243,6 +272,41 @@ impl LighterWsRequest {
 pub struct LighterWsSendTx {
     pub tx_type: u8,
     pub tx_info: Box<RawValue>,
+}
+
+/// Payload of a `jsonapi/sendtxbatch` request.
+///
+/// Unlike the single-transaction frame, the venue takes both members as
+/// *strings*: `tx_types` is a JSON-encoded array of transaction-type
+/// discriminants and `tx_infos` a JSON-encoded array whose elements are
+/// themselves the JSON strings produced by
+/// [`crate::signing::tx::TxInfoJson`]. This mirrors `json.dumps(...)` on both
+/// lists in the reference `lighter-python` client.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LighterWsSendTxBatch {
+    pub tx_types: String,
+    pub tx_infos: String,
+}
+
+impl LighterWsSendTxBatch {
+    /// Encode `txs` (type, pre-rendered `tx_info` JSON) into the venue's
+    /// double-encoded batch payload, preserving submission order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either list cannot be serialized.
+    pub fn encode<'a, I>(txs: I) -> serde_json::Result<Self>
+    where
+        I: IntoIterator<Item = (u8, &'a RawValue)>,
+    {
+        let (tx_types, tx_infos): (Vec<u8>, Vec<&str>) =
+            txs.into_iter().map(|(ty, info)| (ty, info.get())).unzip();
+
+        Ok(Self {
+            tx_types: serde_json::to_string(&tx_types)?,
+            tx_infos: serde_json::to_string(&tx_infos)?,
+        })
+    }
 }
 
 /// Wire labels for the Lighter WebSocket channel taxonomy.
@@ -888,6 +952,28 @@ mod tests {
     const WS_HEIGHT_UPDATE: &str = include_str!("../../test_data/ws_height_update.json");
     const WS_CANDLE_SUBSCRIBED: &str = include_str!("../../test_data/ws_candle_subscribed.json");
     const WS_CANDLE_UPDATE: &str = include_str!("../../test_data/ws_candle_update.json");
+
+    #[rstest]
+    fn test_send_tx_batch_request_double_encodes_both_lists() {
+        let create = RawValue::from_string(r#"{"Nonce":1}"#.to_string()).unwrap();
+        let cancel = RawValue::from_string(r#"{"Nonce":2}"#.to_string()).unwrap();
+        let data = LighterWsSendTxBatch::encode([(1_u8, &*create), (3_u8, &*cancel)]).unwrap();
+
+        assert_eq!(data.tx_types, "[1,3]");
+        assert_eq!(data.tx_infos, r#"["{\"Nonce\":1}","{\"Nonce\":2}"]"#);
+
+        let payload = serde_json::to_string(&LighterWsRequest::SendTxBatch { data }).unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(value["type"], "jsonapi/sendtxbatch");
+        assert_eq!(value["data"]["tx_types"], "[1,3]");
+
+        // The venue takes `tx_infos` as a JSON *string* whose elements are
+        // themselves JSON strings, so it survives a second parse.
+        let infos: Vec<String> =
+            serde_json::from_str(value["data"]["tx_infos"].as_str().unwrap()).unwrap();
+        assert_eq!(infos, vec![r#"{"Nonce":1}"#, r#"{"Nonce":2}"#]);
+    }
 
     #[rstest]
     fn test_subscription_request_serializes_public_channel() {

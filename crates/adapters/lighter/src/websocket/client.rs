@@ -1091,6 +1091,36 @@ impl LighterWebSocketClient {
         })?
     }
 
+    /// Dispatch several signed L2 transactions in a single `sendTxBatch` frame.
+    ///
+    /// Transactions are sent in the given order, which must be ascending by
+    /// nonce; the venue answers the frame with one status and the accepted
+    /// transaction hashes in the same order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be queued or the handler cannot
+    /// report whether it handed the frame to the network writer.
+    pub(crate) async fn send_tx_batch_on_connection(
+        &self,
+        txs: Vec<(u8, Box<serde_json::value::RawValue>)>,
+        connection_epoch: u64,
+    ) -> Result<(), LighterWsError> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.send_cmd(HandlerCommand::SendTxBatch {
+            txs,
+            connection_epoch,
+            response_tx,
+        })
+        .await?;
+
+        response_rx.await.map_err(|e| {
+            LighterWsError::SendTxOutcomeUnknown(format!(
+                "handler dropped sendTxBatch result after accepting the command: {e}",
+            ))
+        })?
+    }
+
     #[cfg(test)]
     pub(crate) async fn drop_next_send_tx_result_for_test(&self) {
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();

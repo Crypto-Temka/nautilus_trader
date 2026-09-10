@@ -837,6 +837,7 @@ fn build_config(addr: SocketAddr) -> LighterExecutionClientConfig {
         market_order_slippage_bps: 50,
         rest_quota_per_min: None,
         sendtx_quota_per_min: None,
+        tx_batch_window_ms: None,
         transport_backend: Default::default(),
     }
 }

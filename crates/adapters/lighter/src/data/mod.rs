@@ -497,6 +497,7 @@ impl LighterDataClient {
                                 | NautilusWsMessage::AccountState(_)
                                 | NautilusWsMessage::SendTxAck { .. }
                                 | NautilusWsMessage::SendTxRejected { .. }
+                                | NautilusWsMessage::SendTxBatchAck { .. }
                                 | NautilusWsMessage::AccountStreamFirstFrame(_),
                             ) => {}
                             Some(NautilusWsMessage::Reconnected { .. }) => {

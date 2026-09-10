@@ -58,7 +58,10 @@ use crate::{
         models::LighterOrder,
         query::{LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery},
     },
-    signing::{auth_token::build_auth_token_for, nonce::NonceManager},
+    signing::{
+        auth_token::build_auth_token_for,
+        nonce::{DEFAULT_SKIP_WINDOW, NonceManager},
+    },
     websocket::parse::parse_ws_order_status_report,
 };
 
@@ -584,10 +587,27 @@ pub(crate) struct WsDispatchState {
     /// rejection back to the originating order (sendTx error frames carry no
     /// correlation field). Single-account WS connection, so one global queue.
     pub(crate) pending_sendtx: Arc<Mutex<VecDeque<PendingSendTx>>>,
+    /// FIFO queue of `sendTxBatch` frames awaiting a venue response, holding
+    /// the transaction hashes of each frame in submission order. The venue
+    /// answers a batch with one status and no per-transaction codes, and a
+    /// rejected batch may omit the hashes entirely, so the sender records
+    /// them here to fan the outcome back out over the batch members.
+    pending_sendtx_batches: Arc<Mutex<VecDeque<PendingSendTxBatch>>>,
     /// First-frame readiness flags handed to the WS feed handler so
     /// `connect()` blocks until every account stream has produced a frame.
     /// Cloned cheaply since the inner state is shared via `Arc`.
     pub(crate) account_streams_ready: Arc<AccountStreamsReady>,
+}
+
+/// One in-flight `sendTxBatch` frame, tracked so its single venue response
+/// can be attributed to every transaction it carried.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingSendTxBatch {
+    /// Process-unique id so a sender whose frame never reached the network
+    /// can retract its own record without disturbing frames still in flight.
+    pub(crate) batch_id: u64,
+    pub(crate) connection_epoch: u64,
+    pub(crate) tx_hashes: Vec<String>,
 }
 
 /// Compact snapshot of the mutable shape of a tracked order used by the
@@ -785,11 +805,17 @@ impl WsDispatchState {
     /// Construct a fresh dispatch state with empty translation tables and a
     /// default-window nonce manager.
     pub(crate) fn new() -> Self {
+        Self::with_skip_window(DEFAULT_SKIP_WINDOW)
+    }
+
+    /// Construct a fresh dispatch state whose nonce manager tolerates
+    /// `skip_window` outstanding allocations.
+    pub(crate) fn with_skip_window(skip_window: u32) -> Self {
         Self {
             cloid_map: Arc::new(DashMap::new()),
             retired_orders: Arc::new(RetiredOrderCache::new(REPLAY_CACHE_CAPACITY)),
             venue_id_map: Arc::new(DashMap::new()),
-            nonce_manager: Arc::new(NonceManager::default()),
+            nonce_manager: Arc::new(NonceManager::new(skip_window)),
             last_account_state: Arc::new(Mutex::new(None)),
             active_markets: Arc::new(DashSet::new()),
             position_snapshot: Arc::new(Mutex::new(PositionSnapshot::default())),
@@ -800,6 +826,7 @@ impl WsDispatchState {
             order_snapshots: Arc::new(DashMap::new()),
             pending_order_actions: Arc::new(DashMap::new()),
             pending_sendtx: Arc::new(Mutex::new(VecDeque::new())),
+            pending_sendtx_batches: Arc::new(Mutex::new(VecDeque::new())),
             account_streams_ready: Arc::new(AccountStreamsReady::new()),
         }
     }
@@ -903,6 +930,44 @@ impl WsDispatchState {
             p.connection_epoch == connection_epoch && p.tx_hash.eq_ignore_ascii_case(tx_hash)
         })?;
         q.remove(pos)
+    }
+
+    /// Record the transaction hashes of a `sendTxBatch` frame handed to the
+    /// venue, in submission order.
+    pub(crate) fn enqueue_pending_sendtx_batch(&self, batch: PendingSendTxBatch) {
+        self.pending_sendtx_batches.lock().push_back(batch);
+    }
+
+    /// Pop the oldest in-flight batch for `connection_epoch`.
+    ///
+    /// Batch responses arrive in submission order on a single connection, so
+    /// the head is the frame being answered.
+    pub(crate) fn pop_pending_sendtx_batch(
+        &self,
+        connection_epoch: u64,
+    ) -> Option<PendingSendTxBatch> {
+        let mut queue = self.pending_sendtx_batches.lock();
+        let pos = queue
+            .iter()
+            .position(|batch| batch.connection_epoch == connection_epoch)?;
+        queue.remove(pos)
+    }
+
+    /// Retract a batch record whose frame never reached the network.
+    pub(crate) fn remove_pending_sendtx_batch(&self, batch_id: u64) {
+        self.pending_sendtx_batches
+            .lock()
+            .retain(|batch| batch.batch_id != batch_id);
+    }
+
+    /// Drop every in-flight batch record owned by one disconnected connection.
+    ///
+    /// The individual transactions are drained separately by
+    /// [`Self::drain_pending_sendtx`], which is what reconciliation keys off.
+    pub(crate) fn drain_pending_sendtx_batches(&self, connection_epoch: u64) {
+        self.pending_sendtx_batches
+            .lock()
+            .retain(|batch| batch.connection_epoch != connection_epoch);
     }
 
     /// Drain pending entries owned by one disconnected connection.

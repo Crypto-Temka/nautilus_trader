@@ -79,6 +79,7 @@ const CTRL_TYPE_PING: &str = "ping";
 const CTRL_TYPE_PONG: &str = "pong";
 const CTRL_TYPE_ERROR: &str = "error";
 const CTRL_TYPE_SEND_TX: &str = "jsonapi/sendtx";
+const CTRL_TYPE_SEND_TX_BATCH: &str = "jsonapi/sendtxbatch";
 
 #[derive(serde::Deserialize)]
 struct LighterWsFrameHeader<'a> {
@@ -142,6 +143,15 @@ pub enum HandlerCommand {
         connection_epoch: u64,
         response_tx: tokio::sync::oneshot::Sender<Result<(), LighterWsError>>,
     },
+    /// Dispatch several signed L2 transactions in one `sendTxBatch` frame.
+    ///
+    /// The venue meters the batch as a single request and answers it with one
+    /// status plus the accepted transaction hashes in submission order.
+    SendTxBatch {
+        txs: Vec<(u8, Box<serde_json::value::RawValue>)>,
+        connection_epoch: u64,
+        response_tx: tokio::sync::oneshot::Sender<Result<(), LighterWsError>>,
+    },
 }
 
 impl Debug for HandlerCommand {
@@ -202,6 +212,11 @@ impl Debug for HandlerCommand {
                 .debug_struct(stringify!(SendTx))
                 .field("tx_type", tx_type)
                 .field("tx_info", &"<redacted>")
+                .finish(),
+            Self::SendTxBatch { txs, .. } => f
+                .debug_struct(stringify!(SendTxBatch))
+                .field("len", &txs.len())
+                .field("tx_infos", &"<redacted>")
                 .finish(),
         }
     }
@@ -475,6 +490,48 @@ impl FeedHandler {
         }
     }
 
+    async fn dispatch_send_tx_batch(
+        &self,
+        txs: Vec<(u8, Box<serde_json::value::RawValue>)>,
+        connection_epoch: u64,
+    ) -> Result<(), LighterWsError> {
+        let len = txs.len();
+        let data = match super::messages::LighterWsSendTxBatch::encode(
+            txs.iter().map(|(tx_type, tx_info)| (*tx_type, &**tx_info)),
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                log::error!("Error serializing Lighter sendTxBatch (len={len}): {e}");
+                return Err(LighterWsError::Client(format!(
+                    "failed to serialize Lighter sendTxBatch: {e}"
+                )));
+            }
+        };
+
+        match serde_json::to_string(&LighterWsRequest::SendTxBatch { data }) {
+            Ok(payload) => {
+                log::debug!(
+                    "Sending Lighter sendTxBatch: len={len} ({} bytes)",
+                    payload.len(),
+                );
+
+                match self.send_once(payload, connection_epoch).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        log::error!("Error dispatching Lighter sendTxBatch (len={len}): {e}");
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing Lighter sendTxBatch (len={len}): {e}");
+                Err(LighterWsError::Client(format!(
+                    "failed to serialize Lighter sendTxBatch: {e}"
+                )))
+            }
+        }
+    }
+
     async fn dispatch_unsubscribe(&self, channel: LighterWsChannel) {
         let topic = channel.topic_key();
         self.subscriptions.mark_unsubscribe(&topic);
@@ -592,6 +649,19 @@ impl FeedHandler {
 
                             if response_tx.send(result).is_err() {
                                 log::debug!("Lighter sendTx result receiver dropped");
+                            }
+                        }
+                        HandlerCommand::SendTxBatch {
+                            txs,
+                            connection_epoch,
+                            response_tx,
+                        } => {
+                            let result = self
+                                .dispatch_send_tx_batch(txs, connection_epoch)
+                                .await;
+
+                            if response_tx.send(result).is_err() {
+                                log::debug!("Lighter sendTxBatch result receiver dropped");
                             }
                         }
                     }
@@ -1065,6 +1135,35 @@ impl FeedHandler {
                         (true, None)
                     }
                 }
+            }
+            CTRL_TYPE_SEND_TX_BATCH => {
+                let Some(code) = value.get("code").and_then(|v| v.as_u64()) else {
+                    log::warn!(
+                        "Ignoring malformed Lighter sendTxBatch response without numeric code: {value}",
+                    );
+                    return (true, None);
+                };
+
+                if code == LIGHTER_ERROR_CODE_INTEGRATOR_NOT_APPROVED {
+                    log_integrator_not_approved();
+                } else if code == 200 {
+                    log::debug!("Lighter WebSocket sendTxBatch ack: {value}");
+                } else {
+                    log::error!("Lighter sendTxBatch rejected: {value}");
+                }
+
+                (
+                    true,
+                    Some(NautilusWsMessage::SendTxBatchAck {
+                        connection_epoch: 0,
+                        code: i64::try_from(code).unwrap_or(i64::MAX),
+                        tx_hashes: send_tx_batch_hashes(value),
+                        message: value
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                    }),
+                )
             }
             CTRL_TYPE_SUBSCRIBED | CTRL_TYPE_UNSUBSCRIBED => {
                 if let Some(topic) = value.get("channel").and_then(|v| v.as_str()) {
@@ -1996,6 +2095,22 @@ fn find_book_level(
 
 // Codes outside the transaction range (e.g. 30003 "Already Subscribed")
 // would falsely reject a live order; see `LIGHTER_ERROR_CODE_TX_RANGE`.
+// The venue answers a batch with `tx_hash` as an array of hashes in
+// submission order. A rejected batch may omit it entirely, in which case the
+// execution client falls back to the hashes it recorded when sending.
+fn send_tx_batch_hashes(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("tx_hash")
+        .and_then(|v| v.as_array())
+        .map(|hashes| {
+            hashes
+                .iter()
+                .filter_map(|hash| hash.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn is_sendtx_error_code(code: Option<u64>) -> bool {
     code.is_some_and(|c| LIGHTER_ERROR_CODE_TX_RANGE.contains(&c))
 }
@@ -2729,6 +2844,56 @@ mod tests {
                 assert_eq!(tx_hash.as_deref(), Some("0000abcd"));
             }
             other => panic!("expected SendTxAck, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn handle_control_text_sendtxbatch_success_carries_hashes_in_order() {
+        let mut handler = make_handler_with_account();
+        let payload = serde_json::json!({
+            "type": "jsonapi/sendtxbatch",
+            "code": 200,
+            "tx_hash": ["0000abcd", "0000ef01"],
+        })
+        .to_string();
+
+        let (_, msg) = handle_control_text(&mut handler, &payload);
+
+        match msg.expect("SendTxBatchAck emitted") {
+            NautilusWsMessage::SendTxBatchAck {
+                code, tx_hashes, ..
+            } => {
+                assert_eq!(code, 200);
+                assert_eq!(tx_hashes, vec!["0000abcd", "0000ef01"]);
+            }
+            other => panic!("expected SendTxBatchAck, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    fn handle_control_text_sendtxbatch_failure_reports_batch_code_without_hashes() {
+        let mut handler = make_handler_with_account();
+        let payload = serde_json::json!({
+            "type": "jsonapi/sendtxbatch",
+            "code": 21105,
+            "message": "nonces must be increasing",
+        })
+        .to_string();
+
+        let (_, msg) = handle_control_text(&mut handler, &payload);
+
+        match msg.expect("SendTxBatchAck emitted") {
+            NautilusWsMessage::SendTxBatchAck {
+                code,
+                tx_hashes,
+                message,
+                ..
+            } => {
+                assert_eq!(code, 21105);
+                assert!(tx_hashes.is_empty());
+                assert_eq!(message.as_deref(), Some("nonces must be increasing"));
+            }
+            other => panic!("expected SendTxBatchAck, was {other:?}"),
         }
     }
 

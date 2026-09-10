@@ -110,6 +110,8 @@ class LighterExecutionClientConfig:
     @property
     def sendtx_quota_per_min(self) -> int | None: ...
     @property
+    def tx_batch_window_ms(self) -> int | None: ...
+    @property
     def transport_backend(self) -> network.TransportBackend: ...
     def __init__(
         self,
@@ -126,6 +128,7 @@ class LighterExecutionClientConfig:
         market_order_slippage_bps: int | None = None,
         rest_quota_per_min: int | None = None,
         sendtx_quota_per_min: int | None = None,
+        tx_batch_window_ms: int | None = None,
         transport_backend: network.TransportBackend | None = None,
         deployment: LighterDeployment | None = None,
         venue: model.Venue | None = None,

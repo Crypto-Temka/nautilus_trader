@@ -27,6 +27,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
     future::Future,
     sync::{
         Arc,
@@ -116,8 +117,8 @@ use crate::{
         client::{LighterWebSocketClient, RetainedTaskSlot, TaskRetentionGuard},
         dispatch::{
             LIGHTER_INSTRUMENT_CACHE, MAX_RECONCILIATION_PAGES, OrderIdentity, PendingOrderAction,
-            PendingSendTx, PendingSendTxKind, TradeDedupSource, WsDispatchState,
-            cache_instruments_for_reports, derive_market_order_price_ticks,
+            PendingSendTx, PendingSendTxBatch, PendingSendTxKind, TradeDedupSource,
+            WsDispatchState, cache_instruments_for_reports, derive_market_order_price_ticks,
             evict_terminal_mappings, lookup_create_order_status_report, lookup_order_status_report,
             nautilus_to_lighter_order_type, nautilus_to_lighter_tif, order_expiry_for,
             parse_http_order_to_report, price_to_ticks, quantity_to_ticks,
@@ -186,6 +187,20 @@ const INTEGRATOR_AUTO_APPROVAL_MAX_TTL_MS: i64 = 5 * 365 * 24 * 60 * 60 * 1_000;
 const INTEGRATOR_AUTO_APPROVAL_MAX_FEE_TICK: u32 = 0;
 const NONCE_CONNECTION_EPOCH_UNAVAILABLE: u64 = u64::MAX;
 
+/// Nonce skip-window applied when transaction batching is enabled.
+///
+/// A coalesced frame signs up to [`LIGHTER_MAX_BATCH_TX`] transactions before
+/// any of them reaches the venue, so the default window of 16 outstanding
+/// allocations would be exhausted by one in-flight batch plus a stray
+/// single-transaction command. Batched transactions arrive together and in
+/// ascending nonce order, so the venue applies them as one contiguous run
+/// rather than as 15 independent out-of-order submissions.
+const TX_BATCH_SKIP_WINDOW: u32 = (LIGHTER_MAX_BATCH_TX as u32) * 2 + 2;
+
+/// Source of the process-unique ids that let a sender retract its own
+/// in-flight `sendTxBatch` record.
+static NEXT_TX_BATCH_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct LighterExecutionClient {
     core: ExecutionClientCore,
@@ -212,6 +227,7 @@ pub struct LighterExecutionClient {
     dispatch: WsDispatchState,
     nonce_recovery_inflight: Arc<AtomicBool>,
     auth_refresh_notify: Arc<tokio::sync::Notify>,
+    tx_batch: Option<TxBatchCoalescer>,
 }
 
 impl LighterExecutionClient {
@@ -303,6 +319,16 @@ impl LighterExecutionClient {
         );
         let pending_tasks = TaskGroup::new();
 
+        // A single batch reserves up to `LIGHTER_MAX_BATCH_TX` nonces before
+        // any of them reaches the venue, so the default skip window would be
+        // spent by one in-flight frame plus a stray single-tx command.
+        let tx_batch = config.tx_batch_window().map(TxBatchCoalescer::new);
+        let dispatch = if tx_batch.is_some() {
+            WsDispatchState::with_skip_window(TX_BATCH_SKIP_WINDOW)
+        } else {
+            WsDispatchState::new()
+        };
+
         Ok(Self {
             core,
             clock,
@@ -325,9 +351,10 @@ impl LighterExecutionClient {
             ws_handler_retained: Arc::new(RetainedTaskSlot::new()),
             auth_refresh_handle: TaskSlot::new(),
             shutdown_errors: Vec::new(),
-            dispatch: WsDispatchState::new(),
+            dispatch,
             nonce_recovery_inflight: Arc::new(AtomicBool::new(false)),
             auth_refresh_notify: Arc::new(tokio::sync::Notify::new()),
+            tx_batch,
         })
     }
 
@@ -1176,6 +1203,7 @@ impl LighterExecutionClient {
                                 let _refresh_guard = nonce_submission_gate.write().await;
                                 let disconnected_epoch = connection_epoch.saturating_sub(1);
                                 let stale = dispatch.drain_pending_sendtx(disconnected_epoch);
+                                dispatch.drain_pending_sendtx_batches(disconnected_epoch);
                                 warn_pending_sendtx_unknown(&stale, "reconnect");
 
                                 if let Some(credential) = &credential_for_loop {
@@ -1289,38 +1317,88 @@ impl LighterExecutionClient {
                                     );
                                     let _refresh_guard = nonce_submission_gate.write().await;
 
-                                    match http_client_for_loop
-                                        .get_next_nonce(
-                                            credential.account_index(),
-                                            credential.api_key_index(),
-                                        )
-                                        .await
-                                    {
-                                        Ok(response) => {
-                                            dispatch.nonce_manager.refresh(
-                                                credential.account_index(),
-                                                credential.api_key_index(),
-                                                response.nonce,
-                                            );
-                                            nonce_ready_connection_epoch
-                                                .store(connection_epoch, Ordering::Release);
-                                            log::debug!(
-                                                "Hard-refreshed Lighter nonce after invalid-nonce \
-                                                 rejection: account_index={}, next_nonce={}",
-                                                credential.account_index(),
-                                                response.nonce,
-                                            );
-                                        }
-                                        Err(e) => {
-                                            log::error!(
-                                                "Failed to refresh Lighter nonce after \
-                                                 invalid-nonce rejection: {e}",
-                                            );
-                                            nonce_refresh_retry
-                                                .clone()
-                                                .spawn(connection_epoch);
-                                        }
+                                    hard_refresh_nonce_after_rejection(
+                                        &http_client_for_loop,
+                                        &dispatch,
+                                        credential,
+                                        &nonce_ready_connection_epoch,
+                                        &nonce_refresh_retry,
+                                        connection_epoch,
+                                        "invalid-nonce rejection",
+                                    )
+                                    .await;
+                                }
+                            }
+                            Some(NautilusWsMessage::SendTxBatchAck {
+                                connection_epoch,
+                                code,
+                                tx_hashes,
+                                message,
+                            }) => {
+                                let account_index = credential_for_loop
+                                    .as_ref()
+                                    .map(|c| c.account_index());
+                                let (acked, needs_nonce_resync) = handle_send_tx_batch_response(
+                                    &dispatch,
+                                    &emitter,
+                                    account_index,
+                                    connection_epoch,
+                                    clock_for_loop.get_time_ns(),
+                                    code,
+                                    &tx_hashes,
+                                    message.as_deref(),
+                                );
+
+                                if let Some(credential) = credential_for_loop.clone() {
+                                    for pending in &acked {
+                                        spawn_acked_order_probe(
+                                            pending,
+                                            AckedOrderProbeContext {
+                                                http_client: http_client_for_loop.clone(),
+                                                registry: Arc::clone(&registry_for_loop),
+                                                credential: credential.clone(),
+                                                dispatch: dispatch.clone(),
+                                                account_id: account_id_for_loop,
+                                                clock: clock_for_loop,
+                                                emitter: emitter.clone(),
+                                                connection_epoch: ws_client
+                                                    .connection_epoch_atomic(),
+                                                cancellation_token: cancellation_token.clone(),
+                                                pending_tasks: pending_tasks_for_loop.clone(),
+                                            },
+                                        );
                                     }
+                                }
+
+                                // A batch shares one nonce run, so a rejection
+                                // burns every nonce in it; only a hard refresh
+                                // moves allocation back down.
+                                if needs_nonce_resync
+                                    && let Some(credential) = &credential_for_loop
+                                {
+                                    if ws_client.connection_epoch() != connection_epoch {
+                                        log::warn!(
+                                            "Skipping stale Lighter batch rejection from connection \
+                                             epoch {connection_epoch}",
+                                        );
+                                        continue;
+                                    }
+                                    nonce_ready_connection_epoch.store(
+                                        NONCE_CONNECTION_EPOCH_UNAVAILABLE,
+                                        Ordering::Release,
+                                    );
+                                    let _refresh_guard = nonce_submission_gate.write().await;
+
+                                    hard_refresh_nonce_after_rejection(
+                                        &http_client_for_loop,
+                                        &dispatch,
+                                        credential,
+                                        &nonce_ready_connection_epoch,
+                                        &nonce_refresh_retry,
+                                        connection_epoch,
+                                        "batch rejection",
+                                    )
+                                    .await;
                                 }
                             }
                             Some(NautilusWsMessage::Raw(value)) => {
@@ -1706,6 +1784,7 @@ impl LighterExecutionClient {
             dispatch: self.dispatch.clone(),
             nonce_recovery_inflight: Arc::clone(&self.nonce_recovery_inflight),
             pending_tasks,
+            tx_batch: self.tx_batch.clone(),
         })
     }
 
@@ -2419,6 +2498,42 @@ async fn sleep_or_auth_token_refresh_cancelled(
     }
 }
 
+// Hard-reset the nonce baseline from the venue after a rejection burned one
+// or more issued nonces. The caller holds the submission gate and has already
+// marked the connection's nonce state unavailable.
+async fn hard_refresh_nonce_after_rejection(
+    http_client: &LighterHttpClient,
+    dispatch: &WsDispatchState,
+    credential: &Credential,
+    nonce_ready_connection_epoch: &AtomicU64,
+    nonce_refresh_retry: &NonceRefreshRetry,
+    connection_epoch: u64,
+    context: &str,
+) {
+    match http_client
+        .get_next_nonce(credential.account_index(), credential.api_key_index())
+        .await
+    {
+        Ok(response) => {
+            dispatch.nonce_manager.refresh(
+                credential.account_index(),
+                credential.api_key_index(),
+                response.nonce,
+            );
+            nonce_ready_connection_epoch.store(connection_epoch, Ordering::Release);
+            log::debug!(
+                "Hard-refreshed Lighter nonce after {context}: account_index={}, next_nonce={}",
+                credential.account_index(),
+                response.nonce,
+            );
+        }
+        Err(e) => {
+            log::error!("Failed to refresh Lighter nonce after {context}: {e}");
+            nonce_refresh_retry.clone().spawn(connection_epoch);
+        }
+    }
+}
+
 fn auth_token_refresh_next_delay(outcome: AuthTokenRefreshOutcome) -> Option<Duration> {
     match outcome {
         AuthTokenRefreshOutcome::Rotated => Some(AUTH_TOKEN_REFRESH_INTERVAL),
@@ -2577,7 +2692,9 @@ impl Drop for TxSendReservation {
     }
 }
 
-#[cfg(test)]
+// Batched frames hold one reservation per transaction. The lowest nonce is
+// the one the sequencer gates on: once it is at the head, every higher nonce
+// in the frame is free to go out with it.
 async fn wait_for_tx_send_reservations(reservations: &[&TxSendReservation]) {
     let Some(first) = reservations.first() else {
         return;
@@ -2596,6 +2713,94 @@ async fn wait_for_tx_send_reservations(reservations: &[&TxSendReservation]) {
         .min()
         .expect("reservations is non-empty");
     first.sequencer.wait_for_turn(first.key, nonce).await;
+}
+
+/// One signed transaction parked in the batch coalescer.
+///
+/// The transaction already owns its nonce and its slot in the send sequencer,
+/// so nothing about it changes between enqueue and flush; only the moment it
+/// reaches the wire does.
+struct BatchedTx {
+    tx_type: u8,
+    tx_info: Box<serde_json::value::RawValue>,
+    pending: PendingSendTx,
+    send_reservation: TxSendReservation,
+}
+
+/// What the caller must do after handing a transaction to the coalescer.
+enum BatchAdmission {
+    /// Parked; an already-scheduled timer will flush it.
+    Queued,
+    /// Parked and the caller owns the flush timer for this window.
+    ScheduleFlush,
+    /// The window filled up; flush these transactions immediately.
+    FlushNow(Vec<BatchedTx>),
+}
+
+/// Coalesces signed transactions into a single `sendTxBatch` frame.
+///
+/// A batch flushes when it reaches [`LIGHTER_MAX_BATCH_TX`] entries or when
+/// the configured window elapses from the first enqueue, whichever comes
+/// first. Enqueue order is not necessarily nonce order (signing and sending
+/// run in separate tasks), so [`TxBatchCoalescer::take`] sorts: the venue
+/// requires strictly ascending nonces within one frame.
+#[derive(Clone)]
+struct TxBatchCoalescer {
+    window: Duration,
+    queue: Arc<Mutex<Vec<BatchedTx>>>,
+    flush_scheduled: Arc<AtomicBool>,
+}
+
+impl Debug for TxBatchCoalescer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(TxBatchCoalescer))
+            .field("window", &self.window)
+            .field("queued", &self.queue.lock().len())
+            .finish()
+    }
+}
+
+impl TxBatchCoalescer {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            flush_scheduled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn push(&self, tx: BatchedTx) -> BatchAdmission {
+        let mut queue = self.queue.lock();
+        queue.push(tx);
+
+        if queue.len() >= LIGHTER_MAX_BATCH_TX {
+            let batch = Self::drain_sorted(&mut queue);
+            return BatchAdmission::FlushNow(batch);
+        }
+        drop(queue);
+
+        if self.flush_scheduled.swap(true, Ordering::AcqRel) {
+            BatchAdmission::Queued
+        } else {
+            BatchAdmission::ScheduleFlush
+        }
+    }
+
+    /// Clear the timer slot and take everything queued so far.
+    ///
+    /// The slot is cleared first so a transaction enqueued during the drain
+    /// schedules a fresh timer rather than waiting for one that already fired.
+    fn take(&self) -> Vec<BatchedTx> {
+        self.flush_scheduled.store(false, Ordering::Release);
+        let mut queue = self.queue.lock();
+        Self::drain_sorted(&mut queue)
+    }
+
+    fn drain_sorted(queue: &mut Vec<BatchedTx>) -> Vec<BatchedTx> {
+        let mut batch = std::mem::take(queue);
+        batch.sort_unstable_by_key(|tx| tx.pending.nonce);
+        batch
+    }
 }
 
 struct PreparedCreateOrder {
@@ -2656,6 +2861,7 @@ struct FanoutDispatchContext {
     dispatch: WsDispatchState,
     nonce_recovery_inflight: Arc<AtomicBool>,
     pending_tasks: TaskSpawner,
+    tx_batch: Option<TxBatchCoalescer>,
 }
 
 impl FanoutDispatchContext {
@@ -2752,6 +2958,125 @@ impl FanoutDispatchContext {
         }
     }
 
+    /// Park `tx` in the coalescer, flushing when the window fills or elapses.
+    ///
+    /// Called only when batching is configured; the caller has already
+    /// emitted whatever pre-dispatch event the single-transaction path emits.
+    async fn enqueue_batched_tx(&self, coalescer: &TxBatchCoalescer, tx: BatchedTx) {
+        match coalescer.push(tx) {
+            BatchAdmission::Queued => {}
+            BatchAdmission::FlushNow(batch) => self.flush_tx_batch(batch).await,
+            BatchAdmission::ScheduleFlush => {
+                let context = self.clone();
+                let timer_coalescer = coalescer.clone();
+                let window = coalescer.window;
+
+                if let Err(e) = self.pending_tasks.spawn(async move {
+                    tokio::time::sleep(window).await;
+                    context.flush_tx_batch(timer_coalescer.take()).await;
+                }) {
+                    log::warn!("Lighter tx batch timer not started after shutdown began: {e}");
+                    self.flush_tx_batch(coalescer.take()).await;
+                }
+            }
+        }
+    }
+
+    /// Dispatch a coalesced batch, one frame per connection epoch.
+    ///
+    /// A reconnect between two enqueues can leave transactions signed against
+    /// different epochs in the same window; each epoch's run keeps its own
+    /// frame so a stale transaction cannot be sent on a fresh connection.
+    async fn flush_tx_batch(&self, batch: Vec<BatchedTx>) {
+        let mut run: Vec<BatchedTx> = Vec::new();
+
+        for tx in batch {
+            if run
+                .first()
+                .is_some_and(|first| first.pending.connection_epoch != tx.pending.connection_epoch)
+            {
+                self.send_tx_batch(std::mem::take(&mut run)).await;
+            }
+            run.push(tx);
+        }
+        self.send_tx_batch(run).await;
+    }
+
+    async fn send_tx_batch(&self, batch: Vec<BatchedTx>) {
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let connection_epoch = first.pending.connection_epoch;
+        let mut txs = Vec::with_capacity(batch.len());
+        let mut pendings = Vec::with_capacity(batch.len());
+        let mut reservations = Vec::with_capacity(batch.len());
+
+        for tx in batch {
+            txs.push((tx.tx_type, tx.tx_info));
+            pendings.push(tx.pending);
+            reservations.push(tx.send_reservation);
+        }
+
+        log::debug!(
+            "Lighter tx batch: queueing sendTxBatch of {} txs (nonces {}..={})",
+            pendings.len(),
+            pendings[0].nonce,
+            pendings[pendings.len() - 1].nonce,
+        );
+        wait_for_tx_send_reservations(&reservations.iter().collect::<Vec<_>>()).await;
+
+        // The venue meters a batch as one request, so the batch spends one
+        // token regardless of how many transactions it carries.
+        await_tx_quota(&self.tx_rate_limiter).await;
+
+        let batch_id = NEXT_TX_BATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let now = self.clock.get_time_ns();
+
+        for pending in &mut pendings {
+            pending.submitted_at = now;
+            self.dispatch.enqueue_pending_sendtx(pending.clone());
+        }
+        self.dispatch
+            .enqueue_pending_sendtx_batch(PendingSendTxBatch {
+                batch_id,
+                connection_epoch,
+                tx_hashes: pendings.iter().map(|p| p.tx_hash.clone()).collect(),
+            });
+
+        if let Err(e) = self
+            .ws_client
+            .send_tx_batch_on_connection(txs, connection_epoch)
+            .await
+        {
+            let failure = classify_lighter_ws_command_failure("sendTxBatch", &e);
+            let reason = command_failure_reason(&failure);
+            if matches!(&failure, CommandFailure::Ambiguous(_)) {
+                log::warn!(
+                    "Lighter sendTxBatch dispatch outcome unknown for {} txs: {reason}; \
+                     retaining pending state for venue reconciliation; diagnostic={e:?}",
+                    pendings.len(),
+                );
+            } else {
+                log::error!(
+                    "{reason} for {} batched txs; diagnostic={e:?}",
+                    pendings.len(),
+                );
+                self.dispatch.remove_pending_sendtx_batch(batch_id);
+                reject_batched_txs(
+                    &self.dispatch,
+                    &self.emitter,
+                    self.credential.account_index(),
+                    connection_epoch,
+                    &pendings,
+                    reason,
+                    self.clock.get_time_ns(),
+                );
+            }
+        }
+
+        drop(reservations);
+    }
+
     fn sign_create_order(&self, plan: CreateOrderPlan) -> anyhow::Result<PreparedCreateOrder> {
         let cloid = plan.order.client_order_id();
         let client_order_index = self.dispatch.register_create_identity(&plan.order)?;
@@ -2834,6 +3159,31 @@ impl FanoutDispatchContext {
 
         self.emitter.emit_order_submitted(&order);
         log::debug!("Lighter submit_order: queueing CreateOrder tx for {client_order_id}");
+
+        if let Some(coalescer) = self.tx_batch.clone() {
+            self.enqueue_batched_tx(
+                &coalescer,
+                BatchedTx {
+                    tx_type: LighterTxType::CreateOrder as u8,
+                    tx_info,
+                    pending: PendingSendTx {
+                        connection_epoch,
+                        kind: PendingSendTxKind::Create {
+                            order: Box::new(order),
+                            client_order_index,
+                        },
+                        submitted_at: self.clock.get_time_ns(),
+                        nonce,
+                        api_key_index,
+                        tx_hash,
+                    },
+                    send_reservation,
+                },
+            )
+            .await;
+            return;
+        }
+
         send_reservation.wait_for_turn().await;
         await_tx_quota(&self.tx_rate_limiter).await;
         self.dispatch.enqueue_pending_sendtx(PendingSendTx {
@@ -2935,21 +3285,43 @@ impl FanoutDispatchContext {
             mut send_reservation,
         } = prepared;
         let connection_epoch = send_reservation.connection_epoch;
+        let kind = if emit_cancel_rejected {
+            PendingSendTxKind::Cancel {
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+            }
+        } else {
+            PendingSendTxKind::Other
+        };
+
+        if let Some(coalescer) = self.tx_batch.clone() {
+            self.enqueue_batched_tx(
+                &coalescer,
+                BatchedTx {
+                    tx_type: LighterTxType::CancelOrder as u8,
+                    tx_info,
+                    pending: PendingSendTx {
+                        connection_epoch,
+                        kind,
+                        submitted_at: self.clock.get_time_ns(),
+                        nonce,
+                        api_key_index,
+                        tx_hash,
+                    },
+                    send_reservation,
+                },
+            )
+            .await;
+            return;
+        }
 
         send_reservation.wait_for_turn().await;
         await_tx_quota(&self.tx_rate_limiter).await;
         self.dispatch.enqueue_pending_sendtx(PendingSendTx {
             connection_epoch,
-            kind: if emit_cancel_rejected {
-                PendingSendTxKind::Cancel {
-                    strategy_id,
-                    instrument_id,
-                    client_order_id,
-                    venue_order_id,
-                }
-            } else {
-                PendingSendTxKind::Other
-            },
+            kind,
             submitted_at: self.clock.get_time_ns(),
             nonce,
             api_key_index,
@@ -3696,6 +4068,149 @@ fn handle_send_tx_rejection_for_connection(
     }
 
     needs_nonce_resync
+}
+
+// A `sendTxBatch` frame that never reached the network fails every
+// transaction it carried, so each one takes the same terminal path its
+// single-transaction counterpart would take in `send_create_order` /
+// `send_cancel_order`.
+//
+// Nonces roll back highest-first: `ack_failure_if_latest` only decrements the
+// most recent issuance, so descending order frees the whole contiguous run
+// the batch reserved instead of just its tail.
+fn reject_batched_txs(
+    dispatch: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    account_index: i64,
+    connection_epoch: u64,
+    pendings: &[PendingSendTx],
+    reason: &str,
+    now: UnixNanos,
+) {
+    for pending in pendings.iter().rev() {
+        let _ = dispatch.nonce_manager.ack_failure_if_latest(
+            account_index,
+            pending.api_key_index,
+            pending.nonce,
+        );
+    }
+
+    for pending in pendings {
+        dispatch.remove_pending_sendtx_by_nonce(connection_epoch, pending.nonce);
+
+        match &pending.kind {
+            PendingSendTxKind::Create {
+                order,
+                client_order_index,
+            } => {
+                dispatch.forget_cloid(*client_order_index);
+                dispatch.forget_order_identity(&order.client_order_id());
+                emitter.emit_order_rejected(order, reason, now, false);
+            }
+            PendingSendTxKind::Cancel {
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+            } => {
+                dispatch.clear_pending_order_action_if(client_order_id, PendingOrderAction::Cancel);
+                emitter.emit_order_cancel_rejected_event(
+                    *strategy_id,
+                    *instrument_id,
+                    *client_order_id,
+                    *venue_order_id,
+                    reason,
+                    now,
+                );
+            }
+            PendingSendTxKind::Modify {
+                strategy_id,
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+            } => {
+                dispatch.clear_pending_order_action_if(client_order_id, PendingOrderAction::Modify);
+                emitter.emit_order_modify_rejected_event(
+                    *strategy_id,
+                    *instrument_id,
+                    *client_order_id,
+                    *venue_order_id,
+                    reason,
+                    now,
+                );
+            }
+            PendingSendTxKind::Other => log::warn!(
+                "{reason} on non-order batched tx (nonce={} api_key_index={})",
+                pending.nonce,
+                pending.api_key_index,
+            ),
+        }
+    }
+}
+
+// The venue answers a `sendTxBatch` with a single status and the accepted
+// transaction hashes in submission order; there are no per-transaction codes.
+// A rejected batch may omit the hashes entirely, so the sender's recorded
+// order is the fallback. Returns `true` when the nonce stream needs a hard
+// refresh, which is every rejected batch: rolling the run back one nonce at a
+// time is not sound once part of it may have been applied.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "consumer-loop sink that flattens one SendTxBatchAck message without a wrapper struct"
+)]
+fn handle_send_tx_batch_response(
+    dispatch: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    account_index: Option<i64>,
+    connection_epoch: u64,
+    now: UnixNanos,
+    code: i64,
+    tx_hashes: &[String],
+    message: Option<&str>,
+) -> (Vec<PendingSendTx>, bool) {
+    let recorded = dispatch.pop_pending_sendtx_batch(connection_epoch);
+    let hashes = if tx_hashes.is_empty() {
+        recorded.map(|batch| batch.tx_hashes).unwrap_or_default()
+    } else {
+        tx_hashes.to_vec()
+    };
+
+    if hashes.is_empty() {
+        log::warn!("Lighter sendTxBatch response unattributed (code={code}): {message:?}");
+        return (Vec::new(), code != 200);
+    }
+
+    if code == 200 {
+        let acked = hashes
+            .iter()
+            .filter_map(|tx_hash| {
+                handle_send_tx_ack_for_connection(
+                    dispatch,
+                    account_index,
+                    connection_epoch,
+                    code,
+                    Some(tx_hash),
+                )
+            })
+            .collect();
+        return (acked, false);
+    }
+
+    for tx_hash in &hashes {
+        handle_send_tx_rejection_for_connection(
+            dispatch,
+            emitter,
+            account_index,
+            connection_epoch,
+            now,
+            SendTxRejectionSource::Ack,
+            Some(code),
+            message.unwrap_or("Lighter venue rejected sendTxBatch"),
+            Some(tx_hash),
+        );
+    }
+
+    (Vec::new(), true)
 }
 
 fn lighter_reason_indicates_post_only_rejection(reason: &str) -> bool {
@@ -6284,6 +6799,7 @@ mod tests {
             market_order_slippage_bps: 50,
             rest_quota_per_min: None,
             sendtx_quota_per_min: None,
+            tx_batch_window_ms: None,
             transport_backend: Default::default(),
         }
     }
@@ -11250,6 +11766,259 @@ mod tests {
             .nonce_manager
             .next_nonce(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX);
         client_order_index
+    }
+
+    fn batched_tx(sequencer: &TxSendSequencer, nonce: i64) -> BatchedTx {
+        BatchedTx {
+            tx_type: LighterTxType::CreateOrder as u8,
+            tx_info: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+            pending: PendingSendTx {
+                connection_epoch: 0,
+                kind: PendingSendTxKind::Other,
+                submitted_at: UnixNanos::default(),
+                nonce,
+                api_key_index: TEST_API_KEY_INDEX,
+                tx_hash: format!("hash{nonce:02x}"),
+            },
+            send_reservation: sequencer.reserve(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX, nonce),
+        }
+    }
+
+    /// Reset the nonce manager so `count` nonces starting at `first` are
+    /// outstanding, undoing the per-order seeding `enqueue_create` applies.
+    fn seed_nonce_run(client: &LighterExecutionClient, first: i64, count: usize) {
+        client
+            .dispatch
+            .nonce_manager
+            .refresh(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX, first);
+
+        for _ in 0..count {
+            client
+                .dispatch
+                .nonce_manager
+                .next_nonce(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX)
+                .unwrap();
+        }
+    }
+
+    fn batch_nonces(batch: &[BatchedTx]) -> Vec<i64> {
+        batch.iter().map(|tx| tx.pending.nonce).collect()
+    }
+
+    #[rstest]
+    fn tx_batch_coalescer_parks_until_the_window_owner_is_elected() {
+        let coalescer = TxBatchCoalescer::new(Duration::from_millis(5));
+        let sequencer = TxSendSequencer::new();
+
+        assert!(matches!(
+            coalescer.push(batched_tx(&sequencer, 1)),
+            BatchAdmission::ScheduleFlush,
+        ));
+        assert!(matches!(
+            coalescer.push(batched_tx(&sequencer, 2)),
+            BatchAdmission::Queued,
+        ));
+
+        // Taking the window releases the timer slot, so the next transaction
+        // schedules a fresh one rather than waiting for a timer that fired.
+        assert_eq!(batch_nonces(&coalescer.take()), vec![1, 2]);
+        assert!(matches!(
+            coalescer.push(batched_tx(&sequencer, 3)),
+            BatchAdmission::ScheduleFlush,
+        ));
+    }
+
+    #[rstest]
+    fn tx_batch_coalescer_flushes_at_the_venue_batch_cap() {
+        let coalescer = TxBatchCoalescer::new(Duration::from_secs(60));
+        let sequencer = TxSendSequencer::new();
+
+        for nonce in 1..LIGHTER_MAX_BATCH_TX as i64 {
+            assert!(!matches!(
+                coalescer.push(batched_tx(&sequencer, nonce)),
+                BatchAdmission::FlushNow(_),
+            ));
+        }
+
+        let BatchAdmission::FlushNow(batch) =
+            coalescer.push(batched_tx(&sequencer, LIGHTER_MAX_BATCH_TX as i64))
+        else {
+            panic!("the {LIGHTER_MAX_BATCH_TX}th transaction must flush immediately");
+        };
+        assert_eq!(batch.len(), LIGHTER_MAX_BATCH_TX);
+        assert!(coalescer.take().is_empty());
+    }
+
+    #[rstest]
+    fn tx_batch_coalescer_orders_the_frame_by_nonce() {
+        // Signing and sending run in separate tasks, so enqueue order can
+        // invert; the venue rejects a frame whose nonces do not ascend.
+        let coalescer = TxBatchCoalescer::new(Duration::from_millis(5));
+        let sequencer = TxSendSequencer::new();
+
+        for nonce in [3, 1, 2] {
+            coalescer.push(batched_tx(&sequencer, nonce));
+        }
+
+        assert_eq!(batch_nonces(&coalescer.take()), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn send_tx_batch_response_acks_every_member_in_order() {
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let mut tx_hashes = Vec::new();
+
+        for (i, nonce) in [10_i64, 11, 12].into_iter().enumerate() {
+            let order = test_limit_order(&mut factory, instrument_id, &format!("BATCH-{i}"));
+            enqueue_create(&client, &order, nonce);
+            tx_hashes.push(format!("hash{nonce:02x}"));
+        }
+        seed_nonce_run(&client, 10, 3);
+        client
+            .dispatch
+            .enqueue_pending_sendtx_batch(PendingSendTxBatch {
+                batch_id: 1,
+                connection_epoch: 0,
+                tx_hashes: tx_hashes.clone(),
+            });
+
+        let (acked, needs_nonce_resync) = handle_send_tx_batch_response(
+            &client.dispatch,
+            &client.emitter,
+            Some(TEST_ACCOUNT_INDEX_I64),
+            0,
+            UnixNanos::from(1_000_000_100),
+            200,
+            &tx_hashes,
+            None,
+        );
+
+        assert!(!needs_nonce_resync);
+        assert_eq!(
+            acked.iter().map(|p| p.nonce).collect::<Vec<_>>(),
+            vec![10, 11, 12],
+        );
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+        assert_eq!(
+            client
+                .dispatch
+                .nonce_manager
+                .baseline(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX),
+            Some(12),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "an accepted batch must not emit order events",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_tx_batch_rejection_rejects_every_member_and_forces_a_nonce_refresh() {
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let mut expected_cloids = Vec::new();
+        let mut tx_hashes = Vec::new();
+
+        for (i, nonce) in [10_i64, 11, 12].into_iter().enumerate() {
+            let order = test_limit_order(&mut factory, instrument_id, &format!("BATCH-REJ-{i}"));
+            enqueue_create(&client, &order, nonce);
+            expected_cloids.push(order.client_order_id());
+            tx_hashes.push(format!("hash{nonce:02x}"));
+        }
+        seed_nonce_run(&client, 10, 3);
+        client
+            .dispatch
+            .enqueue_pending_sendtx_batch(PendingSendTxBatch {
+                batch_id: 1,
+                connection_epoch: 0,
+                tx_hashes,
+            });
+
+        // A rejected batch carries one code for the whole frame and may omit
+        // the hashes, so the sender's recorded order is what fans it out.
+        let (acked, needs_nonce_resync) = handle_send_tx_batch_response(
+            &client.dispatch,
+            &client.emitter,
+            Some(TEST_ACCOUNT_INDEX_I64),
+            0,
+            UnixNanos::from(1_000_000_100),
+            21105,
+            &[],
+            Some("nonces must be increasing"),
+        );
+
+        assert!(needs_nonce_resync);
+        assert!(acked.is_empty());
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+
+        for cloid in expected_cloids {
+            match recv_order_event(&mut rx).await {
+                OrderEventAny::Rejected(event) => {
+                    assert_eq!(event.client_order_id, cloid);
+                    assert!(event.reason.as_str().contains("LIGHTER_21105"));
+                }
+                event => panic!("expected rejected event, was {event:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reject_batched_txs_rolls_back_the_whole_nonce_run() {
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let mut pendings = Vec::new();
+        let mut expected_cloids = Vec::new();
+
+        for (i, nonce) in [10_i64, 11, 12].into_iter().enumerate() {
+            let order = test_limit_order(&mut factory, instrument_id, &format!("BATCH-DROP-{i}"));
+            let client_order_index = enqueue_create(&client, &order, nonce);
+            expected_cloids.push(order.client_order_id());
+            pendings.push(PendingSendTx {
+                connection_epoch: 0,
+                kind: PendingSendTxKind::Create {
+                    order: Box::new(order),
+                    client_order_index,
+                },
+                submitted_at: UnixNanos::from(1_000_000_000),
+                nonce,
+                api_key_index: TEST_API_KEY_INDEX,
+                tx_hash: format!("hash{nonce:02x}"),
+            });
+        }
+        seed_nonce_run(&client, 10, 3);
+
+        reject_batched_txs(
+            &client.dispatch,
+            &client.emitter,
+            TEST_ACCOUNT_INDEX_I64,
+            0,
+            &pendings,
+            "Lighter sendTxBatch dispatch failed",
+            UnixNanos::from(1_000_000_100),
+        );
+
+        // Every nonce the frame reserved is freed, not just its tail.
+        assert_eq!(
+            client
+                .dispatch
+                .nonce_manager
+                .last_issued(TEST_ACCOUNT_INDEX_I64, TEST_API_KEY_INDEX),
+            Some(9),
+        );
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+
+        for cloid in expected_cloids {
+            match recv_order_event(&mut rx).await {
+                OrderEventAny::Rejected(event) => assert_eq!(event.client_order_id, cloid),
+                event => panic!("expected rejected event, was {event:?}"),
+            }
+        }
     }
 
     fn enqueue_other(client: &LighterExecutionClient, nonce: i64) {
