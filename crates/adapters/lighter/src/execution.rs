@@ -1286,20 +1286,22 @@ impl LighterExecutionClient {
                                 let account_index = credential_for_loop
                                     .as_ref()
                                     .map(|c| c.account_index());
-                                let needs_nonce_resync = handle_send_tx_rejection_for_connection(
-                                    &dispatch,
-                                    &emitter,
-                                    account_index,
-                                    connection_epoch,
-                                    clock_for_loop.get_time_ns(),
-                                    source,
-                                    code,
-                                    &message,
-                                    tx_hash.as_deref(),
-                                );
+                                let needs_nonce_resync =
+                                    handle_send_tx_rejection_or_batch_for_connection(
+                                        &dispatch,
+                                        &emitter,
+                                        account_index,
+                                        connection_epoch,
+                                        clock_for_loop.get_time_ns(),
+                                        source,
+                                        code,
+                                        &message,
+                                        tx_hash.as_deref(),
+                                    );
 
-                                // Invalid nonce means the sequential stream is
-                                // wedged on a burned nonce; only a hard refresh
+                                // Invalid nonce, or any bare error attributed
+                                // to a whole batch, wedges the sequential
+                                // stream on burned nonces; only a hard refresh
                                 // moves allocation back down.
                                 if needs_nonce_resync
                                     && let Some(credential) = &credential_for_loop
@@ -4196,7 +4198,38 @@ fn handle_send_tx_batch_response(
         return (acked, false);
     }
 
-    for tx_hash in &hashes {
+    reject_batch_members(
+        dispatch,
+        emitter,
+        account_index,
+        connection_epoch,
+        now,
+        Some(code),
+        message.unwrap_or("Lighter venue rejected sendTxBatch"),
+        &hashes,
+    );
+
+    (Vec::new(), true)
+}
+
+// Fan one venue rejection out over every member of a batch, in submission
+// order. Each hash is authoritative attribution, so the source only decides
+// the hashless fallback that never applies here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the single-transaction rejection call shape it delegates to"
+)]
+fn reject_batch_members(
+    dispatch: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    account_index: Option<i64>,
+    connection_epoch: u64,
+    now: UnixNanos,
+    code: Option<i64>,
+    message: &str,
+    tx_hashes: &[String],
+) {
+    for tx_hash in tx_hashes {
         handle_send_tx_rejection_for_connection(
             dispatch,
             emitter,
@@ -4204,13 +4237,70 @@ fn handle_send_tx_batch_response(
             connection_epoch,
             now,
             SendTxRejectionSource::Ack,
-            Some(code),
-            message.unwrap_or("Lighter venue rejected sendTxBatch"),
+            code,
+            message,
             Some(tx_hash),
         );
     }
+}
 
-    (Vec::new(), true)
+// A bare venue error frame carries no correlation field, and the hashless
+// fallback in `handle_send_tx_rejection_for_connection` only fires when a
+// single transaction is pending. With a `sendTxBatch` in flight that fallback
+// never matches, which used to leave the whole frame unattributed and its
+// orders stuck in `SUBMITTED`. A batch shares one venue outcome and one nonce
+// run, so the oldest in-flight batch is attributed as a whole and every member
+// takes the rejection path.
+//
+// Returns `true` when the nonce stream needs a hard refresh.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "consumer-loop sink that flattens one SendTxRejected message without a wrapper struct"
+)]
+fn handle_send_tx_rejection_or_batch_for_connection(
+    dispatch: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    account_index: Option<i64>,
+    connection_epoch: u64,
+    now: UnixNanos,
+    source: SendTxRejectionSource,
+    code: Option<i64>,
+    message: &str,
+    tx_hash: Option<&str>,
+) -> bool {
+    if matches!(source, SendTxRejectionSource::BareError)
+        && tx_hash.is_none()
+        && let Some(batch) = dispatch.pop_pending_sendtx_batch(connection_epoch)
+    {
+        log::error!(
+            "Lighter bare error frame attributed to an in-flight sendTxBatch of {} txs \
+             (code={code:?}): {message:?}",
+            batch.tx_hashes.len(),
+        );
+        reject_batch_members(
+            dispatch,
+            emitter,
+            account_index,
+            connection_epoch,
+            now,
+            code,
+            message,
+            &batch.tx_hashes,
+        );
+        return true;
+    }
+
+    handle_send_tx_rejection_for_connection(
+        dispatch,
+        emitter,
+        account_index,
+        connection_epoch,
+        now,
+        source,
+        code,
+        message,
+        tx_hash,
+    )
 }
 
 fn lighter_reason_indicates_post_only_rejection(reason: &str) -> bool {
@@ -11965,6 +12055,117 @@ mod tests {
                 event => panic!("expected rejected event, was {event:?}"),
             }
         }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test wrapper preserves the established rejection call shape"
+    )]
+    fn handle_send_tx_rejection_or_batch(
+        dispatch: &WsDispatchState,
+        emitter: &ExecutionEventEmitter,
+        account_index: Option<i64>,
+        now: UnixNanos,
+        source: SendTxRejectionSource,
+        code: Option<i64>,
+        message: &str,
+        tx_hash: Option<&str>,
+    ) -> bool {
+        handle_send_tx_rejection_or_batch_for_connection(
+            dispatch,
+            emitter,
+            account_index,
+            0,
+            now,
+            source,
+            code,
+            message,
+            tx_hash,
+        )
+    }
+
+    #[tokio::test]
+    async fn bare_error_with_pending_batch_rejects_every_member_and_forces_a_nonce_refresh() {
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let mut expected_cloids = Vec::new();
+        let mut tx_hashes = Vec::new();
+
+        for (i, nonce) in [10_i64, 11, 12].into_iter().enumerate() {
+            let order = test_limit_order(&mut factory, instrument_id, &format!("BARE-BATCH-{i}"));
+            enqueue_create(&client, &order, nonce);
+            expected_cloids.push(order.client_order_id());
+            tx_hashes.push(format!("hash{nonce:02x}"));
+        }
+        seed_nonce_run(&client, 10, 3);
+        client
+            .dispatch
+            .enqueue_pending_sendtx_batch(PendingSendTxBatch {
+                batch_id: 1,
+                connection_epoch: 0,
+                tx_hashes,
+            });
+
+        // Deliberately outside the bare-error attribution window: a batch is
+        // attributed by its recorded hashes, not by submit recency, so a frame
+        // that arrives late still rejects the whole run rather than none of it.
+        let outside_window = UnixNanos::from(1_000_000_000 + 2_000 * 1_000_000);
+        assert!(handle_send_tx_rejection_or_batch(
+            &client.dispatch,
+            &client.emitter,
+            Some(TEST_ACCOUNT_INDEX_I64),
+            outside_window,
+            SendTxRejectionSource::BareError,
+            Some(21104),
+            "invalid nonce",
+            None,
+        ));
+
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+        assert!(
+            client.dispatch.pop_pending_sendtx_batch(0).is_none(),
+            "the attributed batch record must be consumed",
+        );
+
+        for cloid in expected_cloids {
+            match recv_order_event(&mut rx).await {
+                OrderEventAny::Rejected(event) => {
+                    assert_eq!(event.client_order_id, cloid);
+                    assert!(event.reason.as_str().contains("LIGHTER_21104"));
+                }
+                event => panic!("expected rejected event, was {event:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_error_without_pending_batch_keeps_single_tx_attribution() {
+        let (client, cache, mut rx) = create_execution_client();
+        let instrument_id = register_test_instrument(&client, &cache);
+        let mut factory = test_order_factory();
+        let order = test_limit_order(&mut factory, instrument_id, "BARE-NO-BATCH");
+        enqueue_create(&client, &order, 50);
+
+        let within_window = UnixNanos::from(1_000_000_000 + 500 * 1_000_000);
+        assert!(!handle_send_tx_rejection_or_batch(
+            &client.dispatch,
+            &client.emitter,
+            Some(TEST_ACCOUNT_INDEX_I64),
+            within_window,
+            SendTxRejectionSource::BareError,
+            Some(21149),
+            "integrator is not approved",
+            None,
+        ));
+
+        match recv_order_event(&mut rx).await {
+            OrderEventAny::Rejected(event) => {
+                assert_eq!(event.client_order_id, order.client_order_id());
+            }
+            event => panic!("expected rejected event, was {event:?}"),
+        }
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
     }
 
     #[tokio::test]
